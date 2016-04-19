@@ -6,7 +6,7 @@
 
   A High Dynamic Range (HDR) image contains a wider variation of intensity
   and color than is allowed by the RGB format with 1 byte per channel that we
-  have used in the previous assignment.  
+  have used in the previous assignment.
 
   To store this extra information we use single precision floating point for
   each channel.  This allows for an extremely wide range of intensity values.
@@ -53,7 +53,7 @@
   Old TV signals used to be transmitted in this way so that black & white
   televisions could display the luminance channel while color televisions would
   display all three of the channels.
-  
+
 
   Tone-mapping
   ============
@@ -80,6 +80,143 @@
 */
 
 #include "utils.h"
+#include <limits.h>
+#include <float.h>
+#include <math.h>
+#include <stdio.h>
+
+__global__ void reduce_min_kernel(const float* const d_curr_in,
+                                float* d_curr_out,
+                                const size_t size)
+{
+  extern __shared__ float sdata[];
+  int myID = threadIdx.x + blockIdx.x * blockDim.x;
+  int tid = threadIdx.x;
+  if(myID < size) {
+    sdata[tid] = d_curr_in[myID];
+  } else {
+    sdata[tid] = -FLT_MAX;
+  }
+  __syncthreads();
+  if(myID >= size){
+    return;
+  }
+  for(unsigned int s = blockDim.x / 2 ; s>0; s /= 2){
+      if(tid<s){
+          sdata[tid] = min(sdata[tid],sdata[tid + s]);
+      }
+      __syncthreads(); //ensure all adds at one iteration are done
+  }
+  if (tid == 0){
+      d_curr_out[blockIdx.x] = sdata[0];
+  }
+}
+
+__global__ void reduce_max_kernel(const float* const d_curr_in,
+                                float* d_curr_out,
+                                const size_t size)
+{
+  extern __shared__ float sdata[];
+  int myID = threadIdx.x + blockIdx.x * blockDim.x;
+  int tid = threadIdx.x;
+  if(myID < size) {
+    sdata[tid] = d_curr_in[myID];
+  } else {
+    sdata[tid] = -FLT_MAX;
+  }
+  __syncthreads();
+  if(myID >= size){
+    return;
+  }
+  for(unsigned int s = blockDim.x / 2 ; s>0; s /= 2){
+      if(tid<s){
+          sdata[tid] = max(sdata[tid],sdata[tid + s]);
+      }
+      __syncthreads(); //ensure all adds at one iteration are done
+  }
+  if (tid == 0){
+      d_curr_out[blockIdx.x] = sdata[0];
+  }
+}
+
+int get_max_size(int n, int d) {
+    return (int)ceil( (float)n/(float)d ) + 1;
+}
+
+float reduce_minmax(const float* const d_in,
+                    const size_t numRows,
+                    const size_t numCols,
+                    int minmax)
+{
+  const dim3 blockSize(32);
+  size_t size = numRows * numCols;
+  float* d_curr_in;
+  float* d_curr_out;
+  checkCudaErrors(cudaMalloc(&d_curr_in, sizeof(float) * size));
+  checkCudaErrors(cudaMemcpy(d_curr_in, d_in, sizeof(float) * size, cudaMemcpyHostToDevice));
+  size_t current_size = size;
+  dim3 gridSize(get_max_size(current_size,blockSize.x));
+  while(1){
+    checkCudaErrors(cudaMalloc(&d_curr_out, sizeof(float) * gridSize.x));
+    if (minmax == 1){
+    reduce_max_kernel<<<gridSize, blockSize, sizeof(float) * blockSize.x>>>(
+      d_curr_in,
+      d_curr_out,
+      current_size);
+    }else{
+      reduce_min_kernel<<<gridSize, blockSize, sizeof(float) * blockSize.x>>>(
+        d_curr_in,
+        d_curr_out,
+        current_size);
+    }
+    using namespace std;
+    std::cout << current_size << " " << gridSize.x << std::endl;
+    cudaDeviceSynchronize();
+    checkCudaErrors(cudaGetLastError());
+    checkCudaErrors(cudaFree(d_curr_in));
+    d_curr_in = d_curr_out;
+    if (current_size < blockSize.x){
+      break;
+    }
+    current_size =  get_max_size(current_size,blockSize.x);
+    gridSize.x = get_max_size(current_size,blockSize.x);
+  }
+  float h_out;
+  cudaMemcpy(&h_out, d_curr_out, sizeof(float), cudaMemcpyDeviceToHost);
+  cudaFree(d_curr_out);
+  return h_out;
+}
+
+__global__
+void histogram_kernel(unsigned int* d_bins, const float* d_in, const int bin_count, const float lum_min, const float lum_max, const int size) {
+    int mid = threadIdx.x + blockDim.x * blockIdx.x;
+    if(mid >= size)
+        return;
+    float lum_range = lum_max - lum_min;
+    int bin = ((d_in[mid]-lum_min) / lum_range) * bin_count;
+
+    atomicAdd(&d_bins[bin], 1);
+}
+
+__global__
+void scan_kernel(unsigned int* d_bins, int size) {
+    int mid = threadIdx.x + blockDim.x * blockIdx.x;
+    if(mid >= size)
+        return;
+
+    for(int s = 1; s <= size; s *= 2) {
+          int spot = mid - s;
+
+          unsigned int val = 0;
+          if(spot >= 0)
+              val = d_bins[spot];
+          __syncthreads();
+          if(spot >= 0)
+              d_bins[mid] += val;
+          __syncthreads();
+
+    }
+}
 
 void your_histogram_and_prefixsum(const float* const d_logLuminance,
                                   unsigned int* const d_cdf,
@@ -90,6 +227,37 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
                                   const size_t numBins)
 {
   //TODO
+  min_logLum = reduce_minmax(d_logLuminance, numRows, numCols, 0);
+  max_logLum = reduce_minmax(d_logLuminance, numRows, numCols, 1);
+  size_t size = numRows*numCols;
+  unsigned int* d_bins;
+  size_t histo_size = sizeof(unsigned int)*numBins;
+  checkCudaErrors(cudaMalloc(&d_bins, histo_size));
+  checkCudaErrors(cudaMemset(d_bins, 0, histo_size));
+  dim3 thread_dim(1024);
+  dim3 hist_block_dim(get_max_size(size, thread_dim.x));
+  histogram_kernel<<<hist_block_dim, thread_dim>>>(d_bins, d_logLuminance, numBins, min_logLum, max_logLum, size);
+  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+
+  unsigned int h_out[100];
+  cudaMemcpy(&h_out, d_bins, sizeof(unsigned int)*100, cudaMemcpyDeviceToHost);
+  for(int i = 0; i < 100; i++)
+      printf("hist out %d\n", h_out[i]);
+
+  dim3 scan_block_dim(get_max_size(numBins, thread_dim.x));
+
+  scan_kernel<<<scan_block_dim, thread_dim>>>(d_bins, numBins);
+  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+
+  cudaMemcpy(&h_out, d_bins, sizeof(unsigned int)*100, cudaMemcpyDeviceToHost);
+  for(int i = 0; i < 100; i++)
+      printf("cdf out %d\n", h_out[i]);
+
+
+  cudaMemcpy(d_cdf, d_bins, histo_size, cudaMemcpyDeviceToDevice);
+
+
+  checkCudaErrors(cudaFree(d_bins));
   /*Here are the steps you need to implement
     1) find the minimum and maximum value in the input logLuminance channel
        store in min_logLum and max_logLum
